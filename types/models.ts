@@ -2,6 +2,22 @@ import type { StellarNetwork } from "./stellar";
 
 export type OnboardingStatus = "not_started" | "in_progress" | "completed";
 
+// ─── Employee Lifecycle Management (#454) ────────────────────────────────────
+
+export type EmployeeLifecycleStatus =
+  | "active"
+  | "suspended"
+  | "offboarded";
+
+export interface EmployeeLifecycleEvent {
+  id: string;
+  employeeId: string;
+  action: "activate" | "suspend" | "offboard";
+  performedBy: string;
+  performedAt: string;
+  note?: string;
+}
+
 export interface Employee {
   id: string;
   address: string;
@@ -18,6 +34,12 @@ export interface Employee {
   lastOnboardingAttemptAt?: string | null;
   startDate: string;
   lastPayment?: string;
+  /** Lifecycle management status — complements `isActive` / `status`. */
+  lifecycleStatus?: EmployeeLifecycleStatus;
+  suspendedAt?: string | null;
+  offboardedAt?: string | null;
+  /** Privacy-safe reason for the most recent lifecycle transition. */
+  lifecycleNote?: string | null;
 }
 
 export interface Company {
@@ -50,6 +72,16 @@ export interface CompanyContractConfig {
 export interface CompanyConfig extends Company {
   network: StellarNetwork;
   contracts: CompanyContractConfig;
+  /**
+   * Schema version of the organization policy configuration. Versions below
+   * {@link CURRENT_CONFIG_SCHEMA_VERSION} are considered legacy and must be
+   * migrated (validated via `validateCompanyConfigMigration`) before they are
+   * used for payroll.
+   *
+   * Optional for backward compatibility: configs without this field are
+   * treated as schema version 1 (see {@link DEFAULT_CONFIG_SCHEMA_VERSION}).
+   */
+  configSchemaVersion?: number;
   /** Optional token (SAC/asset) contract used for disbursements. */
   tokenContractId?: string;
   /** Optional audit/logging settings */
@@ -59,6 +91,30 @@ export interface CompanyConfig extends Company {
     requireAuditorApproval?: boolean;
   };
 }
+
+/**
+ * Schema version assumed for configs persisted before versioning was
+ * introduced (config created before `configSchemaVersion` existed).
+ */
+export const DEFAULT_CONFIG_SCHEMA_VERSION = 1;
+
+/** The newest organization policy schema version the dashboard understands. */
+export const CURRENT_CONFIG_SCHEMA_VERSION = 2;
+
+/** Incompatible policy combinations introduced in schema version 2. */
+export type ConfigSchemaV2Incompatibility =
+  | "audit-settings-on-public-network"
+  | "inactive-company";
+
+export const CONFIG_SCHEMA_V2_INCOMPATIBILITIES: Record<
+  ConfigSchemaV2Incompatibility,
+  string
+> = {
+  "audit-settings-on-public-network":
+    "Audit logging cannot be required on Stellar Mainnet (PUBLIC). Disable auditor approval or switch to TESTNET.",
+  "inactive-company":
+    "Inactive companies cannot hold a migrated (current) policy. Reactivate the company before migrating.",
+};
 
 export type HealthCheckKey =
   | "companySetup"
@@ -85,8 +141,6 @@ export interface CompanyHealthCheckResult {
   timestamp: string;
 }
 
-
-
 export type UserRole = "admin" | "operator" | "auditor";
 
 export interface SessionPayload {
@@ -95,15 +149,33 @@ export interface SessionPayload {
   expiresAt: number;
 }
 
+export type ReconciliationOutcome =
+  | "matched"
+  | "pending"
+  | "mismatched"
+  | "failed"
+  | "manually_reviewed";
+
+export type ReconciliationStatus = ReconciliationOutcome | "partial" | "complete";
+
 export interface PayrollTransaction {
   id: string;
   companyId: string;
   timestamp: string;
   createdAt: string; // Added for consistency with API filters
+  updatedAt?: string | null;
+  lastUpdated?: string | null;
   totalAmount: number;
   employeeCount: number;
   proof: string;
   status: "pending" | "verified" | "failed" | "cancelled";
+  reconciliationStatus?: ReconciliationStatus;
+  reconciliationDetails?: {
+    processedCount: number;
+    totalCount: number;
+    discrepancies?: string[];
+    lastReconciliedAt?: string;
+  };
   approvalStatus?:
     | "draft"
     | "pending_executive_approval"
@@ -118,11 +190,45 @@ export interface PayrollTransaction {
     action?: "approved" | "rejected" | "correction_requested" | "resubmitted";
   }>;
   txHash?: string;
+  /** Settlement reference used for receipt lookup; absent until confirmed. */
+  receiptId?: string | null;
+  /** Account sequence reported by the network for this execution, when available. */
+  confirmationNonce?: string | null;
   isArchived?: boolean;
+  /**
+   * Reconciliation outcome for run-derived history rows (#284). Absent when
+   * the transaction has not been reconciled yet; the quick-filter toolbar
+   * treats a missing value as "does not match a specific reconciliation
+   * filter" rather than guessing. Mirrors `PayrollRun["reconciliationStatus"]`.
+   */
+  reconciliationStatus?: "pending" | "partial" | "complete" | "failed";
+  /**
+   * Cancellation reason for run-derived history rows (#284). Mirrors
+   * `PayrollRun["cancellationReason"]`.
+   */
+  cancellationReason?:
+    | "treasury_insufficient"
+    | "approval_rejected"
+    | "compliance_hold"
+    | "duplicate_batch"
+    | "manual_request"
+    | "expired_proof"
+    | "unknown";
 }
+
+export type PayrollCancellationReason =
+  | "treasury_insufficient"
+  | "approval_rejected"
+  | "compliance_hold"
+  | "duplicate_batch"
+  | "manual_request"
+  | "expired_proof"
+  | "unknown";
 
 export interface PayrollRun extends PayrollTransaction {
   employeeIds: string[];
+  /** Settlement-service receipt identifier; absent until settlement completes. */
+  receiptId?: string | null;
   executedAt?: string | null;
   transactionHash?: string | null;
   reconciliationStatus?: "pending" | "partial" | "complete" | "failed";
@@ -132,6 +238,11 @@ export interface PayrollRun extends PayrollTransaction {
     discrepancies?: string[];
     lastReconciliedAt?: string;
   };
+  /** Cancellation details — present only when status is cancelled. */
+  cancellationReason?: PayrollCancellationReason;
+  cancellationDetail?: string;
+  cancelledAt?: string | null;
+  cancelledBy?: string | null;
 }
 
 export interface ViewKey {
@@ -181,6 +292,13 @@ export interface PayrollWizardState {
   currentStep: PayrollWizardStep;
   employeeIds: string[];
   totalAmount: number;
+  /**
+   * Version of the saved payroll policy snapshotted when this draft started
+   * (#534). The badge on the review/confirm steps compares it against the
+   * active version so a mid-run policy change is visible. Null when the draft
+   * predates version snapshotting or no saved policy existed.
+   */
+  instructionVersion?: number | null;
   proof: string | null;
   proofStatus: "idle" | "generating" | "success" | "error";
   proofError: string | null;
@@ -218,7 +336,15 @@ export interface AuditAccessRequest {
   requesterEmail: string;
   scope: "read-only" | "full-audit";
   rationale: string;
-  status: "pending" | "approved" | "rejected" | "expired" | "revoked" | "export_ready";
+  reviewerNotes?: string;
+  requestedExpiresAt?: string;
+  status:
+    | "pending"
+    | "approved"
+    | "rejected"
+    | "expired"
+    | "revoked"
+    | "export_ready";
   createdAt: string;
   updatedAt?: string;
   viewKeyId?: string;
@@ -292,7 +418,11 @@ export interface MultiAssetPayrollRun {
   proofStatus: "none" | "generating" | "ready" | "expired";
 }
 
-export type ReconciliationGroupStatus = "complete" | "partial" | "failed" | "pending";
+export type ReconciliationGroupStatus =
+  | "complete"
+  | "partial"
+  | "failed"
+  | "pending";
 
 export interface ReconciliationEntry {
   employeeId: string;
@@ -384,7 +514,12 @@ export interface OverduePayrollAlert {
 
 // ─── Approval Comment History (#222) ─────────────────────────────────────────
 
-export type ApprovalAction = "approved" | "rejected" | "requested_changes" | "commented" | "submitted";
+export type ApprovalAction =
+  | "approved"
+  | "rejected"
+  | "requested_changes"
+  | "commented"
+  | "submitted";
 
 export interface ApprovalComment {
   id: string;
@@ -395,7 +530,50 @@ export interface ApprovalComment {
   createdByName: string;
   createdAt: string;
   attachmentUrl?: string | null;
+  attachmentMetadata?: PayrollAttachmentMetadata | null;
 }
+
+export interface PayrollAttachmentMetadata {
+  fileName: string;
+  uploadedAt: string;
+  owner: string;
+  checksum: string;
+  accessScope: "read-only" | "full-audit";
+}
+// ─── Payroll Dispute Resolution Queue (#317) ──────────────────────────────────
+
+export type DisputeStatus = "active" | "overdue" | "resolved" | "escalated";
+
+export type DisputeResolutionAction = "resolve" | "escalate" | "dismiss";
+
+export type DisputeBlockedAction =
+  | "finalization"
+  | "approval"
+  | "execution"
+  | "reconciliation"
+  | "audit_export";
+
+export interface PayrollDispute {
+  id: string;
+  payrollPeriod: string;
+  payrollBatch: string;
+  status: DisputeStatus;
+  resolutionDeadline: string;
+  safeReasonCode: PayrollLockReasonType;
+  safeReasonDescription: string;
+  blockedActions: DisputeBlockedAction[];
+  requiredReviewer: UserRole;
+  resolutionAction: string;
+  createdAt: string;
+  payrollRunId?: string;
+  raisedBy?: string;
+  reason?: string;
+  isResolved?: boolean;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  resolutionNote?: string;
+}
+
 // ── Compliance Evidence Bundle ───────────────────────────────────────────────
 
 export interface AuditSafeReceipt {
@@ -487,7 +665,11 @@ export type OnboardingStep =
   | "commitment_generated"
   | "active_status";
 
-export type OnboardingStepStatus = "pending" | "in_progress" | "complete" | "failed";
+export type OnboardingStepStatus =
+  | "pending"
+  | "in_progress"
+  | "complete"
+  | "failed";
 
 export interface EmployeeOnboardingStep {
   step: OnboardingStep;
@@ -564,3 +746,240 @@ export interface AuditReadyTimeline {
   exported: boolean;
 }
 
+// ─── Wallet Rotation Approval Timeline (#262) ────────────────────────────────
+
+export type WalletRotationEventType =
+  | "rotation_requested"
+  | "approval_granted"
+  | "approval_rejected"
+  | "cooldown_activated"
+  | "cooldown_expired"
+  | "emergency_override"
+  | "rotation_completed"
+  | "rotation_failed";
+
+export type WalletRotationReasonCode =
+  | "key_compromise"
+  | "device_loss"
+  | "scheduled_rotation"
+  | "compliance_requirement"
+  | "emergency";
+
+export interface WalletRotationEvent {
+  id: string;
+  employeeId: string;
+  type: WalletRotationEventType;
+  timestamp: string;
+  actor: string;
+  reasonCode: WalletRotationReasonCode;
+  previousWallet: string;
+  newWallet?: string;
+  /** Human-readable description — wallet addresses are masked by default */
+  summary: string;
+  metadata?: Record<string, string>;
+}
+
+export interface WalletRotationRequest {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  previousWallet: string;
+  newWallet: string;
+  reasonCode: WalletRotationReasonCode;
+  requestedBy: string;
+  requestedAt: string;
+  status:
+    | "pending"
+    | "approved"
+    | "rejected"
+    | "cooldown"
+    | "completed"
+    | "failed";
+  approvedBy?: string;
+  approvedAt?: string;
+  rejectionReason?: string;
+  cooldownEndsAt?: string;
+  isEmergency?: boolean;
+  events: WalletRotationEvent[];
+  metadata?: Record<string, string>;
+}
+
+export interface WalletRotationCooldown {
+  employeeId: string;
+  rotationId: string;
+  activatedAt: string;
+  expiresAt: string;
+  isActive: boolean;
+}
+
+export interface WalletRotationWarning {
+  type: "cooldown_active" | "payroll_blocker" | "pending_approval";
+  message: string;
+  severity: "info" | "warning" | "critical";
+}
+
+// ─── Compliance Evidence Pointer Manager (#338) ──────────────────────────────
+
+export type EvidencePointerType =
+  | "url"
+  | "ipfs"
+  | "document-hash"
+  | "case-reference";
+
+export type EvidencePointerStatus = "valid" | "invalid" | "pending";
+
+export interface ComplianceEvidencePointer {
+  id: string;
+  /** Review case this pointer is attached to — e.g. an audit or dispute case id */
+  reviewCaseId: string;
+  /** Payroll period/run this evidence pertains to */
+  payrollRunId: string;
+  pointerType: EvidencePointerType;
+  /**
+   * Reference to where the evidence lives (URL, IPFS CID, document hash, or
+   * external case reference number). Never the evidence content itself —
+   * this app never stores or displays raw evidence.
+   */
+  reference: string;
+  description: string;
+  status: EvidencePointerStatus;
+  /** Populated when status is "invalid" */
+  validationError?: string;
+  createdAt: string;
+  createdBy: string;
+}
+
+// ─── Payroll Schedule Calendar Editor (#339) ─────────────────────────────────
+
+/**
+ * A draft, unsaved edit to a recurring payroll template's settlement window
+ * — proposed before being submitted as the template's new policy. Kept
+ * separate from `PayrollTemplate` itself so the calendar editor can preview
+ * changes without mutating the live schedule.
+ */
+export interface DraftSettlementWindow {
+  id: string;
+  templateId: string;
+  /** ISO date (yyyy-mm-dd) the settlement window opens */
+  windowStart: string;
+  /** ISO date (yyyy-mm-dd) the settlement window closes */
+  windowEnd: string;
+  createdAt: string;
+}
+
+// ─── Approver Threshold Rotation (#340) ──────────────────────────────────────
+
+/**
+ * A versioned approval-threshold policy: how many approvers must sign off
+ * on a payroll batch before it can execute. Rotating the threshold creates
+ * a new version rather than mutating the old one, so batches already locked
+ * to a prior version keep their original requirement — see
+ * `ApproverThresholdRotationRequest.affectedBatchIds`.
+ */
+export interface ApproverThresholdPolicy {
+  companyId: string;
+  version: number;
+  requiredApprovals: number;
+  effectiveFrom: string;
+  createdBy: string;
+}
+
+export type ThresholdRotationStatus = "pending" | "confirmed" | "cancelled";
+
+export interface ApproverThresholdRotationRequest {
+  id: string;
+  companyId: string;
+  currentPolicy: ApproverThresholdPolicy;
+  proposedRequiredApprovals: number;
+  /** Payroll batch ids already locked to `currentPolicy.version` — they keep the old threshold. */
+  affectedBatchIds: string[];
+  status: ThresholdRotationStatus;
+  createdAt: string;
+  createdBy: string;
+  confirmedAt?: string | null;
+}
+
+// ─── Period Close Reconciliation Dashboard (#341) ────────────────────────────
+
+export interface FundingReservation {
+  id: string;
+  payrollRunId: string;
+  amount: number;
+  purpose: string;
+  isReleased: boolean;
+  releasedAt?: string | null;
+}
+
+export type PeriodCloseBlockerCategory =
+  | "holds"
+  | "disputes"
+  | "funding_reservations"
+  | "audit_references";
+
+export interface PeriodCloseBlocker {
+  category: PeriodCloseBlockerCategory;
+  description: string;
+}
+
+export interface PeriodCloseChecklistItem {
+  category: PeriodCloseBlockerCategory;
+  label: string;
+  isSatisfied: boolean;
+  blockers: PeriodCloseBlocker[];
+}
+
+export interface PeriodCloseChecklist {
+  payrollRunId: string;
+  items: PeriodCloseChecklistItem[];
+  canClose: boolean;
+}
+
+// ── Exception Triage Dashboard Types (Issue #262) ───────────────────────────
+
+export type ExceptionSeverity = "blocking" | "warning" | "info";
+export type ExceptionCategory =
+  | "zk_proof"
+  | "compliance"
+  | "treasury"
+  | "employee_data"
+  | "network"
+  | "reconciliation";
+
+export type ExceptionSource =
+  | "circuit_verifier"
+  | "wallet_router"
+  | "compliance_check"
+  | "treasury_guard"
+  | "batch_parser"
+  | "oracle_bridge";
+
+export type ExceptionStatus =
+  | "open"
+  | "investigating"
+  | "resolved"
+  | "dismissed";
+
+export interface PayrollTriageException {
+  id: string;
+  runId: string;
+  category: ExceptionCategory;
+  severity: ExceptionSeverity;
+  status: ExceptionStatus;
+  title: string;
+  description: string;
+  source: ExceptionSource;
+  employeeCount: number;
+  affectedEmployees?: Array<{
+    id: string;
+    name: string;
+    department?: string;
+    /** Redacted salary commitment for privacy */
+    salaryCommitmentHash: string;
+  }>;
+  suggestedAction: string;
+  nextStepUrl?: string;
+  createdAt: string;
+  resolvedAt?: string | null;
+  /** Encrypted or redacted token for proof debugging */
+  redactedProofDigest?: string;
+}
